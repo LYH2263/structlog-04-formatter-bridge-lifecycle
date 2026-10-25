@@ -29,6 +29,7 @@ from typing import (
     cast,
 )
 
+from ._bridge import get_bridge_context
 from ._frames import (
     _find_first_app_frame_and_name,
     _format_exception,
@@ -831,6 +832,22 @@ class CallsiteParameterAdder:
     from the `logging` module, and stack frames from modules with names that
     start with values in ``additional_ignores``, if it is specified.
 
+    The fork is decided through the bridge metadata provided by
+    `structlog.stdlib.ProcessorFormatter` (see
+    `structlog.stdlib.get_bridge_context`):
+
+    - A foreign record
+      (`structlog.stdlib.BridgePhase.FOREIGN_PRE_CHAIN` /
+      `structlog.stdlib.BridgePhase.FOREIGN`) is trusted, so the values come
+      from the `logging.LogRecord` mapping.
+    - A *structlog* record (`structlog.stdlib.BridgePhase.STRUCTLOG`) carries
+      callsite attributes pointing into `logging` internals because it went
+      through `wrap_for_formatter`, so the callsite is recomputed by walking
+      the stack instead of trusting the record.
+    - Without bridge metadata (plain *structlog* chain, or an event dict after
+      `structlog.stdlib.ProcessorFormatter.remove_processors_meta`) the stack
+      is walked as well.
+
     The keys used for callsite parameters in the event dictionary are the
     string values of `CallsiteParameter` enum members.
 
@@ -924,12 +941,19 @@ class CallsiteParameterAdder:
     def __call__(
         self, logger: logging.Logger, name: str, event_dict: EventDict
     ) -> EventDict:
-        record: logging.LogRecord | None = event_dict.get("_record")
-        from_structlog: bool = event_dict.get("_from_structlog", False)
+        bridge = get_bridge_context(event_dict)
 
-        # If the event dictionary has a record, but it comes from structlog,
-        # then the callsite parameters of the record will not be correct.
-        if record is not None and not from_structlog:
+        # Trust the record only for foreign records that still carry bridge
+        # metadata.  A record from structlog has its callsite pointing into
+        # logging internals because of wrap_for_formatter, so its callsite is
+        # recomputed from the stack.  Without bridge metadata (plain structlog
+        # chain or after remove_processors_meta) the stack is walked too.
+        if (
+            bridge is not None
+            and bridge.record is not None
+            and not bridge.from_structlog
+        ):
+            record = bridge.record
             for mapping in self._record_mappings:
                 event_dict[mapping.event_dict_key] = record.__dict__[
                     mapping.record_attribute

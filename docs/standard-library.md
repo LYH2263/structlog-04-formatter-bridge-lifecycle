@@ -377,6 +377,8 @@ flowchart TD
 When using {class}`~structlog.stdlib.ProcessorFormatter`, you **must not** use {func}`~structlog.stdlib.render_to_log_kwargs` or {func}`~structlog.stdlib.render_to_log_args_and_kwargs` in your processor chain.
 
 You _**must**_ use {func}`structlog.stdlib.ProcessorFormatter.wrap_for_formatter()` -- otherwise you _**will**_ get puzzling errors from the standard library.
+
+Mixing them now raises a dedicated `structlog.stdlib.IncompatibleBridgeChainError` at runtime, in every processor ordering.
 :::
 
 Thus, the simplest possible configuration looks like the following:
@@ -461,6 +463,51 @@ which (given the same `logging.*` calls as in the previous example) will result 
 >>> structlog.get_logger("structlog").info("amazing", events="oh yes")
 2021-11-15 11:41:47 [info     ] amazing    events=oh yes
 ```
+
+#### Bridge metadata lifecycle
+
+The bridge between *structlog* and `logging` has an explicit, testable lifecycle that your processors can query.
+Each event dictionary inside a `ProcessorFormatter` chain carries an immutable {class}`~structlog.stdlib.BridgeContext` under the `_bridge` key, alongside the two long-standing views `_record` (the `logging.LogRecord` being formatted) and `_from_structlog` (whether the record came from a *structlog* logger).
+
+The phase ({class}`~structlog.stdlib.BridgePhase`) tells you where in the bridge you are:
+
+- `UNWRAPPED`: a plain record/event dict that never went through the bridge.
+- `WRAPPED`: `wrap_for_formatter()` attached the sentinels, `ProcessorFormatter.format()` has not run yet.
+- `STRUCTLOG`: inside `format()` for a *structlog* record. `record.msg` is copied as a dictionary and `foreign_pre_chain` is **never** run.
+- `FOREIGN_PRE_CHAIN`: inside `format()` for a foreign record, while `foreign_pre_chain` runs.
+- `FOREIGN`: the same foreign record, on the shared processor chain after `foreign_pre_chain` finished.
+
+Query it read-only from a processor, a handler, or a test:
+
+```python
+def my_processor(logger, method_name, event_dict):
+    phase = structlog.stdlib.get_bridge_phase(event_dict)
+    if phase is structlog.stdlib.BridgePhase.STRUCTLOG:
+        ...  # record.msg was a dict; do not expect a rendered message
+    if phase is structlog.stdlib.BridgePhase.FOREIGN_PRE_CHAIN:
+        ...  # foreign event still being prepared
+
+    context = structlog.stdlib.get_bridge_context(event_dict)
+    if context is not None:
+        assert context.from_structlog == event_dict["_from_structlog"]
+        assert context.record is event_dict["_record"]
+
+    # Strict variant for processors that require the bridge:
+    structlog.stdlib.require_bridge_context(event_dict)
+    return event_dict
+```
+
+The same helpers accept a `logging.LogRecord` (handlers see the `WRAPPED` phase before formatting) and also understand event dictionaries that third-party code built with only the `_record` / `_from_structlog` keys.
+
+{func}`~structlog.stdlib.ProcessorFormatter.remove_processors_meta` removes `_record`, `_from_structlog`, **and** `_bridge`.
+Metadata-consuming processors must run before it:
+
+- {class}`~structlog.stdlib.ExtraAdder` copies extra `LogRecord` attributes on **both** branches via `_record`.
+- {class}`~structlog.processors.CallsiteParameterAdder` takes the callsite from the `LogRecord` on the foreign branch, but **recomputes it from the stack** on the *structlog* branch -- a wrapped record's `pathname`/`lineno` point into `logging` internals.
+- After removal, the fork is no longer observable: `get_bridge_context()` returns `None`, `CallsiteParameterAdder` falls back to walking the stack, and `require_bridge_context()` raises `structlog.stdlib.MissingBridgeMetadataError` instead of your code silently reading missing keys.
+
+Finally, `format()` works on a fresh shallow copy of the record for every call, so multiple handlers/formatters that share one record do not leak the structlog/foreign decision, cleared `record.args`, callsite parameters, or event-dict mutations into each other.
+Nested mutable values inside the original event dictionary are intentionally shared (shallow snapshot).
 
 This allows you to set up some sophisticated logging configurations.
 For example, to use the standard library's `logging.config.dictConfig` to log colored logs to the console and plain logs to a file you could do:

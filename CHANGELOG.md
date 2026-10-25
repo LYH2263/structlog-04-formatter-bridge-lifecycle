@@ -13,6 +13,37 @@ You can find our backwards-compatibility policy [here](https://github.com/hynek/
 <!-- changelog follows -->
 
 
+## [Unreleased](https://github.com/hynek/structlog/compare/26.1.0...HEAD)
+
+### Added
+
+- `structlog.stdlib.ProcessorFormatter` now gives the bridge to standard-library `logging` a first-class, observable metadata lifecycle.
+  Every formatted event dictionary carries an immutable `structlog.stdlib.BridgeContext` (key `_bridge`) with a `structlog.stdlib.BridgePhase`:
+
+  - `UNWRAPPED` for plain records/event dicts that never entered the bridge,
+  - `WRAPPED` between `ProcessorFormatter.wrap_for_formatter()` and `ProcessorFormatter.format()`,
+  - `STRUCTLOG` inside `format()` for *structlog*-originated records (which never run `foreign_pre_chain`),
+  - `FOREIGN_PRE_CHAIN` while the `foreign_pre_chain` runs on foreign records, and
+  - `FOREIGN` on the shared processor chain afterwards.
+
+  New read-only query helpers `structlog.stdlib.get_bridge_phase()`, `get_bridge_context()`, `get_bridge_record()`, `bridge_metadata_present()`, and the strict `require_bridge_context()` let processors and tests assert which branch they are on and whether the metadata is still present.
+  The legacy `_record` / `_from_structlog` keys remain in lockstep with the context.
+
+- `structlog.processors.CallsiteParameterAdder` now takes the fork from the bridge context: foreign records keep trusting the `logging.LogRecord` mapping, while *structlog* records (whose callsite points into `logging` internals after wrapping) always recompute the callsite from the stack.
+
+- `ProcessorFormatter.format()` is now explicitly snapshot-safe when multiple handlers/formatters format the same record: each call gets its own record copy and event dictionaries, so branch decisions, `args` clearing, callsite parameters, and event-dict mutations can no longer leak between formatters (nested mutable values remain shared by the documented shallow-copy semantics).
+
+### Changed
+
+- `ProcessorFormatter.remove_processors_meta()` also removes the `_bridge` context.
+  Metadata consumers (`ExtraAdder`, `CallsiteParameterAdder`, `add_logger_name`) must run before it; afterwards the structlog/foreign fork is no longer observable and `require_bridge_context()` raises the new `structlog.stdlib.MissingBridgeMetadataError` instead of consumers silently missing keys.
+
+- `ProcessorFormatter.wrap_for_formatter()` combined with `render_to_log_kwargs()` or `render_to_log_args_and_kwargs()` in one chain now raises the new `structlog.stdlib.IncompatibleBridgeChainError` at runtime, in every processor ordering.
+  These are mutually exclusive terminal processors.
+
+- The `use_get_message` argument of `ProcessorFormatter` now explicitly only affects how the event is synthesized for foreign records; the *structlog* branch's dictionary copy contract is unchanged.
+
+
 ## [26.1.0](https://github.com/hynek/structlog/compare/25.5.0...26.1.0) - 2026-06-06
 
 ### Removed

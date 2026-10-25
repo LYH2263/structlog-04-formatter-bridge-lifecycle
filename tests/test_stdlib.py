@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import logging.config
@@ -31,23 +32,37 @@ from structlog._config import _CONFIG
 from structlog._log_levels import CRITICAL, DEBUG, NAME_TO_LEVEL, WARN
 from structlog.dev import ConsoleRenderer
 from structlog.exceptions import DropEvent
-from structlog.processors import JSONRenderer, KeyValueRenderer
+from structlog.processors import (
+    CallsiteParameter,
+    CallsiteParameterAdder,
+    JSONRenderer,
+    KeyValueRenderer,
+)
 from structlog.stdlib import (
     AsyncBoundLogger,
     BoundLogger,
+    BridgeContext,
+    BridgePhase,
     ExtraAdder,
+    IncompatibleBridgeChainError,
     LoggerFactory,
+    MissingBridgeMetadataError,
     PositionalArgumentsFormatter,
     ProcessorFormatter,
     _FixedFindCallerLogger,
     add_log_level,
     add_log_level_number,
     add_logger_name,
+    bridge_metadata_present,
     filter_by_level,
+    get_bridge_context,
+    get_bridge_phase,
+    get_bridge_record,
     get_logger,
     recreate_defaults,
     render_to_log_args_and_kwargs,
     render_to_log_kwargs,
+    require_bridge_context,
 )
 from structlog.testing import CapturedCall
 from structlog.typing import BindableLogger, EventDict
@@ -1521,6 +1536,844 @@ class TestProcessorFormatter:
 
         assert proc.format(record)
         assert "le msg: %s" == event_dicts[0]["event"]
+
+
+def _noop_renderer(_, __, ed):
+    """
+    Terminal renderer for ProcessorFormatter tests.
+    """
+    return ""
+
+
+def _make_wrapped_record(
+    msg=None,
+    *,
+    name="structlog-logger",
+    level=logging.WARNING,
+    args=(),
+    exc_info=None,
+    stack_info=None,
+    method_name="warning",
+    pathname="fake_structlog_path.py",
+    lineno=77,
+    func="fake_structlog_func",
+    extra=None,
+):
+    """
+    Build a record exactly like wrap_for_formatter + logging would.
+    """
+    record = logging.LogRecord(
+        name,
+        level,
+        pathname,
+        lineno,
+        {"event": "structlog-event", "items": [1]} if msg is None else msg,
+        args,
+        exc_info,
+        func,
+        stack_info,
+    )
+    record._logger = logging.getLogger(name)
+    record._name = method_name
+    for key, value in (extra or {}).items():
+        setattr(record, key, value)
+
+    return record
+
+
+def _make_foreign_record(
+    msg="hello %s",
+    args=("world",),
+    *,
+    name="foreign-logger",
+    level=logging.WARNING,
+    exc_info=None,
+    stack_info=None,
+    pathname="fake_foreign_path.py",
+    lineno=88,
+    func="fake_foreign_func",
+    extra=None,
+):
+    """
+    Build a plain (non-structlog) logging record.
+    """
+    record = logging.LogRecord(
+        name, level, pathname, lineno, msg, args, exc_info, func, stack_info
+    )
+    for key, value in (extra or {}).items():
+        setattr(record, key, value)
+
+    return record
+
+
+def _recorder(snapshots, *, mutate=None):
+    """
+    Processor that optionally mutates and then snapshots the event dict.
+    """
+
+    def record(_, __, ed):
+        if mutate is not None:
+            mutate(ed)
+        snapshots.append(ed.copy())
+
+        return ed
+
+    return record
+
+
+class TestBridgeLifecycle:
+    """
+    Formal lifecycle contract for the ProcessorFormatter bridge metadata.
+    """
+
+    # -- Phase 1: observability -----------------------------------------
+
+    def test_phase_unwrapped(self):
+        """
+        Plain records and event dicts that never entered the bridge are
+        UNWRAPPED and carry no metadata.
+        """
+        assert BridgePhase.UNWRAPPED is get_bridge_phase(
+            _make_foreign_record()
+        )
+        raw_ed = {"event": "x"}
+
+        assert BridgePhase.UNWRAPPED is get_bridge_phase(raw_ed)
+        assert bridge_metadata_present(raw_ed) is False
+        assert get_bridge_context(raw_ed) is None
+        assert get_bridge_record(raw_ed) is None
+
+        with pytest.raises(MissingBridgeMetadataError):
+            require_bridge_context(raw_ed)
+        assert issubclass(MissingBridgeMetadataError, KeyError)
+
+    def test_phase_wrapped_before_format(self):
+        """
+        wrap_for_formatter's output, before format() runs, is WRAPPED; the
+        event dictionary traveling as record.msg still has no metadata.
+        """
+        args, kwargs = ProcessorFormatter.wrap_for_formatter(
+            logging.getLogger("x"), "warning", {"event": "e"}
+        )
+
+        assert ({"event": "e"},) == args
+        record = logging.LogRecord(
+            "x",
+            logging.WARNING,
+            "p.py",
+            1,
+            args[0],
+            (),
+            None,
+        )
+        for key, value in kwargs["extra"].items():
+            setattr(record, key, value)
+
+        assert BridgePhase.WRAPPED is get_bridge_phase(record)
+        assert BridgePhase.UNWRAPPED is get_bridge_phase(record.msg)
+        assert bridge_metadata_present(record.msg) is False
+
+    def test_structlog_branch_phases(self):
+        """
+        A handler sees WRAPPED; the shared processor chain sees STRUCTLOG
+        with an immutable context. The metadata disappears after
+        remove_processors_meta.
+        """
+        seen = []
+
+        def probe(logger, name, ed):
+            ctx = get_bridge_context(ed)
+            seen.append(
+                (
+                    get_bridge_phase(ed),
+                    ctx.phase,
+                    ctx.from_structlog,
+                    bridge_metadata_present(ed),
+                    isinstance(get_bridge_record(ed), logging.LogRecord),
+                    require_bridge_context(ed) is ctx,
+                )
+            )
+
+            return ed
+
+        formatter = ProcessorFormatter(
+            processors=[
+                probe,
+                ProcessorFormatter.remove_processors_meta,
+                _noop_renderer,
+            ]
+        )
+
+        class ProbeHandler(logging.Handler):
+            def emit(self, record):
+                seen.append(
+                    (
+                        "handler",
+                        get_bridge_phase(record),
+                        get_bridge_phase(record.msg),
+                        bridge_metadata_present(record.msg),
+                    )
+                )
+                self.format(record)
+
+        configure(
+            processors=[ProcessorFormatter.wrap_for_formatter],
+            logger_factory=LoggerFactory(),
+            wrapper_class=BoundLogger,
+        )
+        logger = logging.getLogger("bridge-phase-structlog")
+        logger.propagate = False
+        logger.setLevel(logging.DEBUG)
+        handler = ProbeHandler()
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
+        try:
+            get_logger("bridge-phase-structlog").warning("hello")
+        finally:
+            logger.removeHandler(handler)
+
+        assert seen == [
+            ("handler", BridgePhase.WRAPPED, BridgePhase.UNWRAPPED, False),
+            (
+                BridgePhase.STRUCTLOG,
+                BridgePhase.STRUCTLOG,
+                True,
+                True,
+                True,
+                True,
+            ),
+        ]
+
+    def test_foreign_branch_phases(self):
+        """
+        foreign_pre_chain sees FOREIGN_PRE_CHAIN; the shared chain sees
+        FOREIGN; both report _from_structlog=False.
+        """
+        seen = []
+
+        def probe_pre(logger, name, ed):
+            seen.append(
+                (
+                    get_bridge_phase(ed),
+                    get_bridge_context(ed).from_structlog,
+                )
+            )
+
+            return ed
+
+        def probe_shared(logger, name, ed):
+            seen.append(
+                (
+                    get_bridge_phase(ed),
+                    get_bridge_context(ed).from_structlog,
+                )
+            )
+
+            return ed
+
+        formatter = ProcessorFormatter(
+            processors=[
+                probe_shared,
+                ProcessorFormatter.remove_processors_meta,
+                _noop_renderer,
+            ],
+            foreign_pre_chain=[probe_pre],
+        )
+        record = _make_foreign_record()
+
+        formatter.format(record)
+
+        assert seen == [
+            (BridgePhase.FOREIGN_PRE_CHAIN, False),
+            (BridgePhase.FOREIGN, False),
+        ]
+
+    def test_structlog_never_runs_foreign_pre_chain(self):
+        """
+        The structlog-source branch must never run foreign_pre_chain, while
+        a foreign record on the same formatter must run it exactly once.
+        """
+        pre_calls = call_recorder(lambda _, __, ed: ed)
+        formatter = ProcessorFormatter(
+            processors=[
+                ProcessorFormatter.remove_processors_meta,
+                _noop_renderer,
+            ],
+            foreign_pre_chain=[pre_calls],
+        )
+
+        configure(
+            processors=[ProcessorFormatter.wrap_for_formatter],
+            logger_factory=LoggerFactory(),
+            wrapper_class=BoundLogger,
+        )
+        logger = logging.getLogger("bridge-pre-chain")
+        logger.propagate = False
+        logger.setLevel(logging.DEBUG)
+        handler = logging.StreamHandler(StringIO())
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
+        try:
+            get_logger("bridge-pre-chain").warning("from structlog")
+            assert 0 == pre_calls.call_count
+
+            logger.warning("from logging")
+            assert 1 == pre_calls.call_count
+        finally:
+            logger.removeHandler(handler)
+
+    @pytest.mark.parametrize("use_get_message", [True, False])
+    def test_foreign_dict_msg_stays_foreign(self, use_get_message):
+        """
+        A foreign record whose msg is a dict must not be copied as a dict
+        like structlog messages: event is synthesized, phase stays FOREIGN,
+        and the original dict msg is untouched across repeated formatting.
+        """
+        snapshots = []
+        formatter = ProcessorFormatter(
+            processors=[_recorder(snapshots), _noop_renderer],
+            foreign_pre_chain=[_recorder(snapshots)],
+            use_get_message=use_get_message,
+        )
+        msg = {"foo": "bar"}
+        record = _make_foreign_record(msg, args=())
+
+        formatter.format(record)
+        formatter.format(record)
+
+        assert {"foo": "bar"} == record.msg
+        assert 4 == len(snapshots)
+        for snapshot in snapshots:
+            phase = get_bridge_phase(snapshot)
+            assert phase in (
+                BridgePhase.FOREIGN,
+                BridgePhase.FOREIGN_PRE_CHAIN,
+            )
+            assert snapshot["_from_structlog"] is False
+            assert snapshot["event"] == "{'foo': 'bar'}"
+            assert snapshot["_record"] is not record
+
+    # -- Phase 2: consumer fork -----------------------------------------
+
+    def test_callsite_adder_trusts_foreign_record(self):
+        """
+        On the foreign branch (both phases) callsite values come from the
+        LogRecord mapping.
+        """
+        snapshots = []
+        adder = CallsiteParameterAdder(
+            parameters=[
+                CallsiteParameter.PATHNAME,
+                CallsiteParameter.LINENO,
+                CallsiteParameter.FUNC_NAME,
+            ]
+        )
+        formatter = ProcessorFormatter(
+            processors=[adder, _recorder(snapshots), _noop_renderer],
+            foreign_pre_chain=[adder, _recorder(snapshots)],
+        )
+        record = _make_foreign_record(
+            pathname="zforeign_file.py",
+            lineno=424,
+            func="foreign_fn",
+        )
+
+        formatter.format(record)
+
+        assert 2 == len(snapshots)
+        for snapshot in snapshots:
+            assert "zforeign_file.py" == snapshot["pathname"]
+            assert 424 == snapshot["lineno"]
+            assert "foreign_fn" == snapshot["func_name"]
+
+    def test_callsite_adder_recomputes_structlog_stack(self):
+        """
+        On the structlog branch the wrapped record's fake callsite is
+        ignored; the stack is walked and lands on this test frame.
+        """
+        snapshots = []
+        adder = CallsiteParameterAdder(
+            parameters=[
+                CallsiteParameter.PATHNAME,
+                CallsiteParameter.LINENO,
+                CallsiteParameter.FUNC_NAME,
+            ]
+        )
+        formatter = ProcessorFormatter(
+            processors=[adder, _recorder(snapshots), _noop_renderer],
+        )
+        record = _make_wrapped_record(
+            pathname="inside_logging.py",
+            lineno=1,
+            func="handle",
+        )
+
+        formatter.format(record)  # stack walk lands on this line
+
+        snapshot = snapshots[0]
+        assert (
+            snapshot["pathname"]
+            .replace("\\", "/")
+            .endswith("tests/test_stdlib.py")
+        )
+        assert (
+            "test_callsite_adder_recomputes_structlog_stack"
+            == snapshot["func_name"]
+        )
+        assert 1 != snapshot["lineno"]
+        assert "inside_logging.py" != snapshot["pathname"]
+
+    def test_extra_adder_reads_record_on_both_branches(self):
+        """
+        ExtraAdder sees the formatted record copy on the structlog branch
+        and on the foreign branch; _record is readable on both.
+        """
+        snapshots = []
+        formatter = ProcessorFormatter(
+            processors=[
+                ExtraAdder(allow={"custom_key"}),
+                _recorder(snapshots),
+                ProcessorFormatter.remove_processors_meta,
+                _noop_renderer,
+            ],
+            foreign_pre_chain=[
+                ExtraAdder(allow={"custom_key"}),
+                _recorder(snapshots),
+            ],
+        )
+
+        structlog_record = _make_wrapped_record(extra={"custom_key": "s"})
+        foreign_record = _make_foreign_record(extra={"custom_key": "f"})
+
+        formatter.format(structlog_record)
+        formatter.format(foreign_record)
+
+        assert "s" == snapshots[0]["custom_key"]
+        assert snapshots[0]["_record"] is not structlog_record
+        assert "f" == snapshots[1]["custom_key"]
+        assert snapshots[1]["_record"] is not foreign_record
+
+    def test_remove_processors_meta_closes_metadata(self):
+        """
+        After remove_processors_meta all bridge metadata is gone and
+        strict consumers fail explicitly.
+        """
+        after = []
+
+        def probe_after(logger, name, ed):
+            after.append(
+                (
+                    bridge_metadata_present(ed),
+                    get_bridge_phase(ed),
+                    get_bridge_context(ed),
+                )
+            )
+            with pytest.raises(MissingBridgeMetadataError):
+                require_bridge_context(ed)
+
+            return ed
+
+        record = _make_foreign_record()
+        formatter = ProcessorFormatter(
+            processors=[
+                ProcessorFormatter.remove_processors_meta,
+                probe_after,
+                _noop_renderer,
+            ]
+        )
+
+        formatter.format(record)
+
+        assert [(False, BridgePhase.UNWRAPPED, None)] == after
+
+    def test_callsite_adder_after_meta_removal_walks_stack(self):
+        """
+        Documented fallback: without metadata the callsite can't be forked
+        anymore and the stack is walked even for a foreign record.
+        """
+        snapshots = []
+        adder = CallsiteParameterAdder(
+            parameters=[CallsiteParameter.PATHNAME, CallsiteParameter.LINENO]
+        )
+        formatter = ProcessorFormatter(
+            processors=[
+                ProcessorFormatter.remove_processors_meta,
+                adder,
+                _recorder(snapshots),
+                _noop_renderer,
+            ]
+        )
+        record = _make_foreign_record(pathname="zforeign_file.py", lineno=5)
+
+        formatter.format(record)  # stack walk lands on this line
+
+        snapshot = snapshots[0]
+        assert (
+            snapshot["pathname"]
+            .replace("\\", "/")
+            .endswith("tests/test_stdlib.py")
+        )
+        assert "zforeign_file.py" != snapshot["pathname"]
+
+    def test_context_is_immutable(self):
+        """
+        BridgeContext is frozen and each format() builds its own instance.
+        """
+        captured = []
+        formatter = ProcessorFormatter(
+            processors=[_recorder(captured), _noop_renderer]
+        )
+        record = _make_wrapped_record()
+
+        formatter.format(record)
+        formatter.format(record)
+
+        first = captured[0]["_bridge"]
+        second = captured[1]["_bridge"]
+
+        assert isinstance(first, BridgeContext)
+        assert first is not second
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            first.phase = BridgePhase.FOREIGN  # type: ignore[misc]
+
+    def test_legacy_keys_fallback(self):
+        """
+        Event dicts built by third parties with bare _record/_from_structlog
+        keys still resolve to the correct source fork.
+        """
+        record = _make_foreign_record()
+
+        assert BridgePhase.FOREIGN == get_bridge_phase(
+            {"_record": record, "_from_structlog": False}
+        )
+        assert BridgePhase.STRUCTLOG == get_bridge_phase(
+            {"_record": record, "_from_structlog": True}
+        )
+        assert record is get_bridge_record(
+            {"_record": record, "_from_structlog": False}
+        )
+
+    def test_get_bridge_phase_rejects_other_types(self):
+        """
+        The phase query is typed for records and mappings.
+        """
+        with pytest.raises(
+            TypeError, match="LogRecord or an event dictionary"
+        ):
+            get_bridge_phase(42)
+
+    # -- Phase 3: copies and multi-handler isolation --------------------
+
+    def test_multi_formatter_structlog_no_pollution(self):
+        """
+        Two ProcessorFormatters formatting the same wrapped record get
+        independent event dicts, branch decisions, and callsite data.
+        """
+        snapshots = []
+        adder = CallsiteParameterAdder(
+            parameters=[
+                CallsiteParameter.PATHNAME,
+                CallsiteParameter.LINENO,
+                CallsiteParameter.FUNC_NAME,
+            ]
+        )
+
+        def make_formatter(mutate):
+            return ProcessorFormatter(
+                processors=[
+                    ExtraAdder(allow={"custom_key"}),
+                    adder,
+                    _recorder(snapshots, mutate=mutate),
+                    ProcessorFormatter.remove_processors_meta,
+                    _noop_renderer,
+                ]
+            )
+
+        formatter1 = make_formatter(lambda ed: ed.update(polluted=True))
+        formatter2 = make_formatter(None)
+        original_msg = {"event": "structlog-event", "items": [1]}
+        record = _make_wrapped_record(original_msg, extra={"custom_key": "v"})
+
+        for formatter in (formatter1, formatter2):
+            formatter.format(record)
+
+        first, second = snapshots
+        assert first["polluted"] is True
+        assert "polluted" not in second
+        assert second["_from_structlog"] is True
+        assert BridgePhase.STRUCTLOG is get_bridge_phase(second)
+        assert "v" == second["custom_key"]
+        for key in ("pathname", "lineno", "func_name"):
+            assert first[key] == second[key]
+        # The original record and its msg dict are untouched.
+        assert original_msg == record.msg
+        assert "_record" not in record.msg
+        assert "_bridge" not in record.msg
+        assert "_from_structlog" not in record.msg
+        assert getattr(record, "_bridge", None) is None
+        assert "warning" == record._name
+        # Shallow snapshot semantics: nested values are deliberately shared.
+        assert first["items"] is original_msg["items"]
+        # Each formatter worked on its own record copy.
+        assert first["_record"] is not second["_record"]
+        assert first["_record"] is not record
+
+    def test_multi_formatter_foreign_no_pollution(self):
+        """
+        Clearing args and mutating the event dict in the first formatter
+        must not change the branch, positional args, extras, or callsite of
+        the second formatting of the same foreign record.
+        """
+        snapshots = []
+        adder = CallsiteParameterAdder(
+            parameters=[CallsiteParameter.PATHNAME, CallsiteParameter.LINENO]
+        )
+
+        def make_formatter(mutate):
+            return ProcessorFormatter(
+                pass_foreign_args=True,
+                processors=[
+                    ExtraAdder(allow={"custom_key"}),
+                    adder,
+                    _recorder(snapshots, mutate=mutate),
+                    ProcessorFormatter.remove_processors_meta,
+                    _noop_renderer,
+                ],
+            )
+
+        formatter1 = make_formatter(lambda ed: ed.pop("positional_args"))
+        formatter2 = make_formatter(None)
+        record = _make_foreign_record(
+            "hello %s", ("world",), extra={"custom_key": "v"}
+        )
+
+        for formatter in (formatter1, formatter2):
+            formatter.format(record)
+
+        first, second = snapshots
+        assert "positional_args" not in first
+        assert ("world",) == second["positional_args"]
+        assert second["_from_structlog"] is False
+        assert "v" == second["custom_key"]
+        assert (
+            first["pathname"] == second["pathname"] == "fake_foreign_path.py"
+        )
+        assert first["lineno"] == second["lineno"] == 88
+        # The first formatter cleared args on its copy only.
+        assert first["_record"].args == ()
+        assert ("world",) == record.args
+        assert "hello %s" == record.msg
+        assert getattr(record, "_bridge", None) is None
+
+    @pytest.mark.parametrize("keep", [True, False])
+    def test_keep_exc_info_copy_vs_event_dict_division(self, keep):
+        """
+        keep_exc_info only governs the record copy's traceback fields; the
+        injected event_dict['exc_info'] is independent and the original
+        record keeps its exc_info for later handlers.
+        """
+        try:
+            raise RuntimeError("oh no")
+        except RuntimeError:
+            exc_info = sys.exc_info()
+
+        observed = []
+
+        def probe(logger, name, ed):
+            ctx = get_bridge_context(ed)
+            observed.append(
+                (
+                    ed["exc_info"],
+                    ctx.record.exc_info,
+                    ctx.record.exc_text,
+                )
+            )
+            if keep:
+                del ed["exc_info"]
+
+            return ed
+
+        formatter = ProcessorFormatter(
+            processors=[
+                probe,
+                ProcessorFormatter.remove_processors_meta,
+                lambda _, __, ed: "rendered",
+            ],
+            keep_exc_info=keep,
+        )
+        record = _make_foreign_record(exc_info=exc_info)
+
+        out = formatter.format(record)
+
+        assert exc_info is observed[0][0]
+        if keep:
+            # Copy kept it, so the base Formatter appends the traceback
+            # even though the processor deleted the event dict entry.
+            assert exc_info is observed[0][1]
+            assert "Traceback (most recent call last):" in out
+        else:
+            assert observed[0][1] is None
+            assert "Traceback (most recent call last):" not in out
+
+        # The original record is still usable by another handler.
+        assert exc_info is record.exc_info
+
+    @pytest.mark.parametrize("keep", [True, False])
+    def test_keep_stack_info_copy_vs_event_dict_division(self, keep):
+        """
+        keep_stack_info only governs the record copy; event_dict keeps its
+        own copy and the original record is unaffected.
+        """
+        observed = []
+
+        def probe(logger, name, ed):
+            ctx = get_bridge_context(ed)
+            observed.append((ed["stack_info"], ctx.record.stack_info))
+
+            return ed
+
+        formatter = ProcessorFormatter(
+            processors=[
+                probe,
+                ProcessorFormatter.remove_processors_meta,
+                lambda _, __, ed: "rendered",
+            ],
+            keep_stack_info=keep,
+        )
+        record = _make_foreign_record(stack_info="STACK_MARKER")
+
+        out = formatter.format(record)
+
+        assert "STACK_MARKER" == observed[0][0]
+        if keep:
+            assert "STACK_MARKER" == observed[0][1]
+            assert "STACK_MARKER" in out
+        else:
+            assert observed[0][1] is None
+            assert "STACK_MARKER" not in out
+        assert "STACK_MARKER" == record.stack_info
+
+    # -- Phase 4: configuration boundary -------------------------------
+
+    def test_wrap_rejects_render_to_log_kwargs_residue(self):
+        """
+        A render_to_log_kwargs-shaped dict must not reach wrap.
+        """
+        with pytest.raises(
+            IncompatibleBridgeChainError, match="wrap_for_formatter"
+        ):
+            ProcessorFormatter.wrap_for_formatter(
+                None, "info", {"msg": "renamed", "extra": {}}
+            )
+
+    def test_wrap_rejects_non_dict(self):
+        """
+        A tuple (as returned by render_to_log_args_and_kwargs) must not
+        reach wrap.
+        """
+        with pytest.raises(
+            IncompatibleBridgeChainError, match="wrap_for_formatter"
+        ):
+            ProcessorFormatter.wrap_for_formatter(
+                None, "info", (("x",), {"extra": {}})
+            )
+
+    def test_renderers_reject_wrap_output(self):
+        """
+        wrap_for_formatter's tuple output must not reach a renderer.
+        """
+        wrapped = ProcessorFormatter.wrap_for_formatter(
+            None, "info", {"event": "x"}
+        )
+
+        with pytest.raises(
+            IncompatibleBridgeChainError, match="render_to_log_kwargs"
+        ):
+            render_to_log_kwargs(None, None, wrapped)
+        with pytest.raises(
+            IncompatibleBridgeChainError,
+            match="render_to_log_args_and_kwargs",
+        ):
+            render_to_log_args_and_kwargs(None, None, wrapped)
+
+    @pytest.mark.parametrize(
+        "chain",
+        [
+            [render_to_log_kwargs, ProcessorFormatter.wrap_for_formatter],
+            [
+                render_to_log_args_and_kwargs,
+                ProcessorFormatter.wrap_for_formatter,
+            ],
+            [ProcessorFormatter.wrap_for_formatter, render_to_log_kwargs],
+            [
+                ProcessorFormatter.wrap_for_formatter,
+                render_to_log_args_and_kwargs,
+            ],
+        ],
+    )
+    def test_incompatible_chains_fail_at_runtime(self, chain):
+        """
+        Every ordering of wrap_for_formatter and a render_to_log_*
+        processor fails with the dedicated error.
+        """
+        bound = BoundLogger(ReturnLogger(), chain, {})
+
+        with pytest.raises(IncompatibleBridgeChainError):
+            bound.info("x")
+
+    @pytest.mark.parametrize("use_get_message", [True, False])
+    def test_use_get_message_does_not_change_structlog_branch(
+        self, use_get_message
+    ):
+        """
+        use_get_message only affects foreign event synthesis: the structlog
+        branch always copies the dict and never calls record.getMessage.
+        """
+        snapshots = []
+        formatter = ProcessorFormatter(
+            processors=[_recorder(snapshots), _noop_renderer],
+            use_get_message=use_get_message,
+        )
+        record = _make_wrapped_record()
+
+        get_message_calls = []
+        original_get_message = record.getMessage
+
+        def tracking_get_message():
+            get_message_calls.append(1)
+
+            return original_get_message()
+
+        record.getMessage = tracking_get_message
+
+        formatter.format(record)
+
+        snapshot = snapshots[0]
+        assert BridgePhase.STRUCTLOG is get_bridge_phase(snapshot)
+        assert "structlog-event" == snapshot["event"]
+        assert snapshot["_from_structlog"] is True
+        # Only logging.Formatter's final message read may call getMessage;
+        # event-dict construction on the structlog branch never does.
+        assert 1 == len(get_message_calls)
+
+    def test_use_get_message_true_interpolates_foreign_event(self):
+        """
+        With use_get_message=True (default) foreign args are interpolated;
+        False keeps the raw msg (locked separately above and in existing
+        tests).
+        """
+        snapshots = []
+        formatter = ProcessorFormatter(
+            processors=[_recorder(snapshots), _noop_renderer],
+            use_get_message=True,
+        )
+        record = _make_foreign_record("le msg: %s", ("keep separate",))
+
+        formatter.format(record)
+
+        assert "le msg: keep separate" == snapshots[0]["event"]
 
 
 @pytest_asyncio.fixture(name="abl")

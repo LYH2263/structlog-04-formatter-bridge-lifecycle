@@ -32,6 +32,21 @@ else:
 
 from . import _config
 from ._base import BoundLoggerBase
+from ._bridge import (
+    BRIDGE_KEY,
+    FROM_STRUCTLOG_KEY,
+    RECORD_KEY,
+    BridgeContext,
+    BridgePhase,
+    IncompatibleBridgeChainError,
+    MissingBridgeMetadataError,
+    bridge_metadata_present,
+    get_bridge_context,
+    get_bridge_phase,
+    get_bridge_record,
+    raise_incompatible_bridge_chain,
+    require_bridge_context,
+)
 from ._frames import _find_first_app_frame_and_name, _format_stack
 from ._log_levels import LEVEL_TO_NAME, NAME_TO_LEVEL, add_log_level
 from .contextvars import (
@@ -53,18 +68,27 @@ from .typing import (
 
 __all__ = [
     "BoundLogger",
+    "BridgeContext",
+    "BridgePhase",
     "ExtraAdder",
+    "IncompatibleBridgeChainError",
     "LoggerFactory",
+    "MissingBridgeMetadataError",
     "PositionalArgumentsFormatter",
     "ProcessorFormatter",
     "add_log_level",
     "add_log_level_number",
     "add_logger_name",
+    "bridge_metadata_present",
     "filter_by_level",
+    "get_bridge_context",
+    "get_bridge_phase",
+    "get_bridge_record",
     "get_logger",
     "recreate_defaults",
     "render_to_log_args_and_kwargs",
     "render_to_log_kwargs",
+    "require_bridge_context",
 ]
 
 
@@ -869,7 +893,7 @@ def add_logger_name(
     """
     Add the logger name to the event dict.
     """
-    record = event_dict.get("_record")
+    record = get_bridge_record(event_dict)
     if record is None:
         event_dict["logger"] = logger.name
     else:
@@ -917,7 +941,7 @@ class ExtraAdder:
     def __call__(
         self, logger: logging.Logger, name: str, event_dict: EventDict
     ) -> EventDict:
-        record: logging.LogRecord | None = event_dict.get("_record")
+        record = get_bridge_record(event_dict)
         if record is not None:
             self._copier(event_dict, record)
         return event_dict
@@ -962,6 +986,11 @@ def render_to_log_args_and_kwargs(
 
     .. versionadded:: 25.1.0
     """
+    if not isinstance(event_dict, dict):
+        # Most likely wrap_for_formatter already ran in the same chain and
+        # returned its (args, kwargs) tuple.
+        raise_incompatible_bridge_chain("render_to_log_args_and_kwargs")
+
     args = (event_dict.pop("event"), *event_dict.pop("positional_args", ()))
 
     kwargs = {
@@ -996,6 +1025,11 @@ def render_to_log_kwargs(
     .. versionchanged:: 24.2.0
        ``stackLevel`` corrected to ``stacklevel``.
     """
+    if not isinstance(event_dict, dict):
+        # Most likely wrap_for_formatter already ran in the same chain and
+        # returned its (args, kwargs) tuple.
+        raise_incompatible_bridge_chain("render_to_log_kwargs")
+
     return {
         "msg": event_dict.pop("event"),
         "extra": event_dict,
@@ -1033,7 +1067,9 @@ class ProcessorFormatter(logging.Formatter):
             Compared to *structlog*'s regular processor chains, there's a few
             differences:
 
-            - The event dictionary contains two additional keys:
+            - The event dictionary carries an explicit, immutable
+              `BridgeContext` under the ``_bridge`` key, together with two
+              stable views that are kept in sync with it:
 
               #. ``_record``: a `logging.LogRecord` that either was created
                   using `logging` APIs, **or** is a wrapped *structlog* log
@@ -1042,10 +1078,29 @@ class ProcessorFormatter(logging.Formatter):
               #. ``_from_structlog``: a `bool` that indicates whether or not
                  ``_record`` was created by a *structlog* logger.
 
-              Since you most likely don't want ``_record`` and
-              ``_from_structlog`` in your log files,  we've added the static
-              method `remove_processors_meta` to ``ProcessorFormatter`` that
-              you can add just before your renderer.
+              The context's `BridgePhase` tells processors where in the
+              bridge lifecycle they are running -- query it read-only with
+              `get_bridge_phase`, `get_bridge_context`, or
+              `bridge_metadata_present`.  The two sources are forked on
+              purpose and never unified:
+
+              - *structlog* records copy ``record.msg`` as a dictionary,
+                get :attr:`BridgePhase.STRUCTLOG`, and **never** run
+                *foreign_pre_chain*.
+              - Foreign records synthesize ``event`` from the record, get
+                :attr:`BridgePhase.FOREIGN_PRE_CHAIN` while
+                *foreign_pre_chain* runs and :attr:`BridgePhase.FOREIGN`
+                on this processor chain afterwards.
+
+              Since you most likely don't want ``_record``,
+              ``_from_structlog`` and ``_bridge`` in your log files, we've
+              added the static method `remove_processors_meta` to
+              ``ProcessorFormatter`` that you can add just before your
+              renderer.  Metadata consumers (like `ExtraAdder` or
+              `structlog.processors.CallsiteParameterAdder`) must run
+              **before** it; after removal the structlog/foreign fork is no
+              longer available (use `require_bridge_context` to fail
+              explicitly).
 
             - Since this is a `logging` *formatter*, raising
               `structlog.DropEvent` will crash your application.
@@ -1080,8 +1135,15 @@ class ProcessorFormatter(logging.Formatter):
             If True, use ``record.getMessage`` to get a fully rendered log
             message, otherwise use ``str(record.msg)``. (default: True)
 
+            Only affects how the ``event`` is synthesized for **foreign**
+            records.  *structlog* records always copy ``record.msg`` as a
+            dictionary, regardless of this setting.
+
     Raises:
         TypeError: If both or neither *processor* and *processors* are passed.
+        IncompatibleBridgeChainError:
+            If *wrap_for_formatter* and a ``render_to_log_*`` processor end
+            up in the same *structlog* processor chain.
 
     .. versionadded:: 17.1.0
     .. versionadded:: 17.2.0 *keep_exc_info* and *keep_stack_info*
@@ -1092,6 +1154,14 @@ class ProcessorFormatter(logging.Formatter):
        *processor* (singular) in favor of *processors* (plural). Removal is not
        planned.
     .. versionadded:: 23.3.0 *use_get_message*
+    .. versionchanged:: 26.2.0
+       Event dictionaries additionally carry an immutable `BridgeContext`
+       under ``_bridge``; the bridge lifecycle is observable with
+       `get_bridge_phase` and related read-only helpers.
+    .. versionchanged:: 26.2.0
+       Combining *wrap_for_formatter* with ``render_to_log_kwargs`` or
+       ``render_to_log_args_and_kwargs`` now raises
+       `IncompatibleBridgeChainError`.
     """
 
     def __init__(
@@ -1135,13 +1205,26 @@ class ProcessorFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         """
-        Extract *structlog*'s `event_dict` from ``record.msg`` and format it.
+        Format *record* through the *structlog* processor chains.
 
-        *record* has been patched by `wrap_for_formatter` first though, so the
-         type isn't quite right.
+        *record* has been patched by `wrap_for_formatter` first for
+        *structlog* entries, so the type isn't quite right.
+
+        Every call works on a fresh shallow copy of *record* and on fresh
+        event dictionaries, so formatting the same record through multiple
+        handlers/ProcessorFormatters does not leak the branch decision
+        (``_from_structlog``), callsite parameters, or extra attributes
+        between formatters.  Only nested mutable *values* inside the
+        original event dictionary are shared (shallow snapshot).
+
+        .. versionchanged:: 26.2.0
+           The active `BridgeContext` is injected into the event dictionary
+           and the foreign branch transitions from
+           :attr:`BridgePhase.FOREIGN_PRE_CHAIN` to
+           :attr:`BridgePhase.FOREIGN`.
         """
-        # Make a shallow copy of the record to let other handlers/formatters
-        # process the original one
+        # Snapshot the record so other handlers/formatters keep processing
+        # the original one.  The copy is shallow on purpose.
         record = logging.makeLogRecord(record.__dict__)
 
         logger = getattr(record, "_logger", _SENTINEL)
@@ -1149,18 +1232,26 @@ class ProcessorFormatter(logging.Formatter):
 
         ed: ProcessorReturnValue
         if logger is not _SENTINEL and meth_name != "__structlog_sentinel__":
-            # Both attached by wrap_for_formatter
+            # structlog-source branch: both sentinels were attached by
+            # wrap_for_formatter.  foreign_pre_chain never runs here.
             if self.logger is not None:
                 logger = self.logger
             meth_name = cast(str, record._name)  # type:ignore[attr-defined]
 
-            # We need to copy because it's possible that the same record gets
-            # processed by multiple logging formatters. LogRecord.getMessage
-            # would transform our dict into a str.
+            # Copy because the same record may be processed by multiple
+            # logging formatters; LogRecord.getMessage would otherwise turn
+            # our dict into a str.  use_get_message does not affect this
+            # branch.
             ed = cast(dict[str, Any], record.msg).copy()
-            ed["_record"] = record
-            ed["_from_structlog"] = True
+            ed[RECORD_KEY] = record
+            ed[FROM_STRUCTLOG_KEY] = True
+            ed[BRIDGE_KEY] = BridgeContext(
+                phase=BridgePhase.STRUCTLOG,
+                from_structlog=True,
+                record=record,
+            )
         else:
+            # Foreign-source branch: synthesize the event from the record.
             logger = self.logger
             meth_name = record.levelname.lower()
             ed = {
@@ -1169,8 +1260,13 @@ class ProcessorFormatter(logging.Formatter):
                     if self.use_get_message
                     else str(record.msg)
                 ),
-                "_record": record,
-                "_from_structlog": False,
+                RECORD_KEY: record,
+                FROM_STRUCTLOG_KEY: False,
+                BRIDGE_KEY: BridgeContext(
+                    phase=BridgePhase.FOREIGN_PRE_CHAIN,
+                    from_structlog=False,
+                    record=record,
+                ),
             }
 
             if self.pass_foreign_args:
@@ -1184,14 +1280,22 @@ class ProcessorFormatter(logging.Formatter):
             if record.stack_info:
                 ed["stack_info"] = record.stack_info
 
-            # Non-structlog allows to run through a chain to prepare it for the
-            # final processor (e.g. adding timestamps and log levels).
+            # Non-structlog records run through a chain to prepare them for
+            # the final processor (e.g. adding timestamps and log levels).
             for proc in self.foreign_pre_chain or ():
                 ed = cast(EventDict, proc(logger, meth_name, ed))
 
+            # The shared chain only ever sees the post-pre-chain phase.
+            ed[BRIDGE_KEY] = BridgeContext(
+                phase=BridgePhase.FOREIGN,
+                from_structlog=False,
+                record=record,
+            )
+
         # If required, unset stack-related attributes on the record copy so
         # that the base implementation doesn't append stacktraces to the
-        # output.
+        # output.  This deliberately only touches the copy: an exc_info that
+        # processors hold in the event dict is independent of this.
         if not self.keep_exc_info:
             record.exc_text = None
             record.exc_info = None
@@ -1228,7 +1332,28 @@ class ProcessorFormatter(logging.Formatter):
         Use this static method as the renderer (in other words, final
         processor) if you want to use `ProcessorFormatter` in your `logging`
         configuration.
+
+        Raises:
+            IncompatibleBridgeChainError:
+                If the chain also contains `render_to_log_kwargs` or
+                `render_to_log_args_and_kwargs`, which is detectable here as
+                a non-dictionary event dictionary or a dictionary without an
+                ``event`` key that carries a ``msg`` key.
+
+        .. versionchanged:: 26.2.0
+           Misconfigured chains that also use a ``render_to_log_*``
+           processor now fail with `IncompatibleBridgeChainError`.
         """
+        if not isinstance(event_dict, dict) or (
+            "event" not in event_dict and "msg" in event_dict
+        ):
+            # render_to_log_args_and_kwargs returns a tuple;
+            # render_to_log_kwargs returns a dict that has ``event`` renamed
+            # to ``msg``.  Neither must reach this terminal processor.
+            raise_incompatible_bridge_chain(
+                "ProcessorFormatter.wrap_for_formatter"
+            )
+
         return (event_dict,), {"extra": {"_logger": logger, "_name": name}}
 
     @staticmethod
@@ -1236,14 +1361,28 @@ class ProcessorFormatter(logging.Formatter):
         _: WrappedLogger, __: str, event_dict: EventDict
     ) -> EventDict:
         """
-        Remove ``_record`` and ``_from_structlog`` from *event_dict*.
+        Remove ``_record``, ``_from_structlog``, and the ``_bridge`` context
+        from *event_dict*.
 
         These keys are added to the event dictionary, before
         `ProcessorFormatter`'s *processors* are run.
 
+        Processors that consume the bridge metadata -- `ExtraAdder`,
+        `structlog.processors.CallsiteParameterAdder`, `add_logger_name`,
+        and custom processors using `get_bridge_context` -- must run **before**
+        this one.  Afterwards the structlog/foreign fork is no longer
+        observable: `get_bridge_context` returns `None` and
+        `structlog.processors.CallsiteParameterAdder` falls back to walking
+        the stack.  Use `require_bridge_context` to raise
+        `MissingBridgeMetadataError` explicitly instead of relying on deleted
+        keys.
+
         .. versionadded:: 21.3.0
+        .. versionchanged:: 26.2.0
+           Also removes the immutable ``_bridge`` `BridgeContext`.
         """
-        del event_dict["_record"]
-        del event_dict["_from_structlog"]
+        del event_dict[RECORD_KEY]
+        del event_dict[FROM_STRUCTLOG_KEY]
+        event_dict.pop(BRIDGE_KEY, None)
 
         return event_dict

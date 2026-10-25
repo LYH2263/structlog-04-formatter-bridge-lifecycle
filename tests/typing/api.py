@@ -9,16 +9,17 @@ Make sure our configuration examples actually pass the type checker.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import logging.config
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import structlog
 
 from structlog.processors import CallsiteParameter
-from structlog.typing import FilteringBoundLogger
+from structlog.typing import EventDict, FilteringBoundLogger
 
 
 bl = structlog.get_logger()
@@ -117,6 +118,61 @@ handler.setFormatter(formatter)
 root_logger = logging.getLogger()
 root_logger.addHandler(handler)
 root_logger.setLevel(logging.INFO)
+
+
+# ProcessorFormatter bridge lifecycle queries
+def bridge_aware_processor(
+    logger: logging.Logger, method_name: str, event_dict: EventDict
+) -> EventDict:
+    phase: structlog.stdlib.BridgePhase = structlog.stdlib.get_bridge_phase(
+        event_dict
+    )
+    if phase is structlog.stdlib.BridgePhase.STRUCTLOG:
+        event_dict["source"] = "structlog"
+    elif phase in (
+        structlog.stdlib.BridgePhase.FOREIGN,
+        structlog.stdlib.BridgePhase.FOREIGN_PRE_CHAIN,
+    ):
+        event_dict["source"] = "foreign"
+
+    context: structlog.stdlib.BridgeContext | None = (
+        structlog.stdlib.get_bridge_context(event_dict)
+    )
+    if context is not None and context.record is not None:
+        event_dict["record_name"] = context.record.name
+
+    record: logging.LogRecord | None = structlog.stdlib.get_bridge_record(
+        event_dict
+    )
+    if record is not None:
+        event_dict["record_levelno"] = record.levelno
+
+    if structlog.stdlib.bridge_metadata_present(event_dict):
+        with contextlib.suppress(structlog.stdlib.MissingBridgeMetadataError):
+            structlog.stdlib.require_bridge_context(event_dict)
+
+    return event_dict
+
+
+def bridge_phase_of_record(record: logging.LogRecord) -> None:
+    phase = structlog.stdlib.get_bridge_phase(record)
+    if phase is structlog.stdlib.BridgePhase.WRAPPED:
+        return
+    if phase is structlog.stdlib.BridgePhase.UNWRAPPED:
+        return
+
+
+def bridge_phase_of_mapping(ed: Mapping[str, object]) -> None:
+    reveal_phase: structlog.stdlib.BridgePhase = (
+        structlog.stdlib.get_bridge_phase(ed)
+    )
+    assert reveal_phase
+
+
+with contextlib.suppress(structlog.stdlib.IncompatibleBridgeChainError):
+    structlog.stdlib.ProcessorFormatter.wrap_for_formatter(
+        logging.getLogger(), "info", {"msg": "x", "extra": {}}
+    )
 
 
 timestamper = structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S")

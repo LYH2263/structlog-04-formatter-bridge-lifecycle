@@ -326,7 +326,31 @@ API Reference
 .. autoclass:: PositionalArgumentsFormatter
 
 .. autoclass:: ProcessorFormatter
-   :members: wrap_for_formatter, remove_processors_meta
+   :members: wrap_for_formatter, remove_processors_meta, format
+
+Bridge Lifecycle Metadata
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autoclass:: BridgePhase
+   :members:
+   :undoc-members:
+
+.. autoclass:: BridgeContext
+   :members:
+
+.. autofunction:: get_bridge_phase
+
+.. autofunction:: get_bridge_context
+
+.. autofunction:: get_bridge_record
+
+.. autofunction:: bridge_metadata_present
+
+.. autofunction:: require_bridge_context
+
+.. autoclass:: IncompatibleBridgeChainError
+
+.. autoclass:: MissingBridgeMetadataError
 
 
 `structlog.tracebacks` Module
